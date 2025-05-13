@@ -1,0 +1,222 @@
+import os
+import yara
+import tempfile
+import shutil
+import datetime
+import threading
+import tkinter as tk
+from tkinter import messagebox, scrolledtext, filedialog, ttk
+
+# Default YARA rule
+YARA_RULE = '''
+rule DetectSuspiciousPatterns{
+    meta:
+        description = "Detects common suspicious commands and indicators"
+    strings:
+        $a = "powershell"
+        $b = "curl"
+        $c = "cmd.exe"
+        $d = "wget"
+        $e = "base64"
+        $f = "net user"
+        $g = "/wp-admin"
+        $h = "/phpmyadmin"
+        $i = ".env"
+        $j = "' OR '1'='1" nocase
+        $k = "--"
+        $l = "&&"
+        $m = "||"
+        $n = "$("
+    condition:
+        any of them
+}
+'''
+
+# Identifier descriptions for scan result readability
+identifier_lookup = {
+    "$a": "powershell",
+    "$b": "curl",
+    "$c": "cmd.exe",
+    "$d": "wget",
+    "$e": "base64",
+    "$f": "net user",
+    "$g": "/wp-admin",
+    "$h": "/phpmyadmin",
+    "$i": ".env",
+    "$j": "SQL Injection attempt",
+    "$k": "-- (SQL comment)",
+    "$l": "command injection: &&",
+    "$m": "command injection: ||",
+    "$n": "command injection: $("
+}
+
+class YaraRuleEditor:
+    def __init__(self, parent, current_rule, callback):
+        self.window = tk.Toplevel(parent)
+        self.window.title("YARA Rule Editor")
+        self.window.geometry("700x500")
+        self.callback = callback
+
+        tk.Label(self.window, text="Edit YARA Rule", font=("Arial", 12, "bold")).pack(pady=5)
+        self.editor = scrolledtext.ScrolledText(self.window, height=20, width=80, font=("Courier", 10))
+        self.editor.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+        self.editor.insert(tk.END, current_rule)
+
+        button_frame = tk.Frame(self.window)
+        button_frame.pack(pady=10)
+        tk.Button(button_frame, text="Save and Compile", command=self.save_rule, bg="green", fg="white").pack(side=tk.LEFT, padx=5)
+        tk.Button(button_frame, text="Cancel", command=self.window.destroy, bg="gray", fg="white").pack(side=tk.LEFT, padx=5)
+
+    def save_rule(self):
+        new_rule = self.editor.get("1.0", tk.END)
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix=".yar") as f:
+                f.write(new_rule)
+                self.temp_path = f.name
+            yara.compile(filepath=self.temp_path)
+            self.callback(new_rule)
+            messagebox.showinfo("Success", "YARA rule compiled successfully!")
+            self.window.destroy()
+        except Exception as e:
+            messagebox.showerror("Error", f"Rule compilation failed:\n{str(e)}")
+        finally:
+            if hasattr(self, 'temp_path') and os.path.exists(self.temp_path):
+                os.remove(self.temp_path)
+
+class YaraScannerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("YARA Malware Pattern Scanner")
+        self.folder_path = ""
+        self.quarantine_path = ""
+        self.results = []
+        self.current_rule = YARA_RULE
+        self.compile_yara_rule()
+
+        # GUI Layout with styled buttons
+        top_frame = tk.Frame(root)
+        top_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        tk.Button(top_frame, text="Select Folder to Scan", command=self.select_folder, bg="blue", fg="white", font=("Arial", 10)).pack(side=tk.LEFT, padx=5)
+        tk.Button(top_frame, text="Select Quarantine Folder", command=self.select_quarantine, bg="orange", fg="white", font=("Arial", 10)).pack(side=tk.LEFT, padx=5)
+        tk.Button(top_frame, text="YARA Rule Editor", command=self.open_rule_editor, bg="purple", fg="white", font=("Arial", 10)).pack(side=tk.LEFT, padx=5)
+        tk.Button(top_frame, text="Start Scan", command=self.start_scan, bg="red", fg="white", font=("Arial", 10)).pack(side=tk.LEFT, padx=5)
+        tk.Button(top_frame, text="Quarantine Detected Files", command=self.quarantine_files, bg="darkred", fg="white", font=("Arial", 10)).pack(side=tk.LEFT, padx=5)
+        tk.Button(top_frame, text="Export Report", command=self.export_report, bg="green", fg="white", font=("Arial", 10)).pack(side=tk.LEFT, padx=5)
+
+        self.output = scrolledtext.ScrolledText(root, height=30, font=("Courier", 10))
+        self.output.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+    def compile_yara_rule(self):
+        with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix=".yar") as f:
+            f.write(self.current_rule)
+            self.rule_path = f.name
+        self.rules = yara.compile(filepath=self.rule_path)
+
+    def open_rule_editor(self):
+        YaraRuleEditor(self.root, self.current_rule, self.update_rule)
+
+    def update_rule(self, new_rule):
+        self.current_rule = new_rule
+        self.compile_yara_rule()
+
+    def select_folder(self):
+        self.folder_path = filedialog.askdirectory()
+
+    def select_quarantine(self):
+        self.quarantine_path = filedialog.askdirectory()
+
+    def start_scan(self):
+        if not self.folder_path:
+            messagebox.showerror("Error", "Please select a folder to scan.")
+            return
+
+        self.results = []
+        self.output.delete("1.0", tk.END)
+        scanned_files, suspicious_count, indicator_count = 0, 0, 0
+
+        all_files = [os.path.join(dp, f) for dp, _, files in os.walk(self.folder_path) for f in files if f.endswith(".txt")]
+
+        for file_path in all_files:
+            scanned_files += 1
+            try:
+                matches = self.rules.match(filepath=file_path)
+                if matches:
+                    suspicious_count += 1
+                    details, file_indicators = [], 0
+                    for match in matches:
+                        for s in match.strings:
+                            details.append(f"   {s.identifier} -> {identifier_lookup.get(s.identifier, 'unknown')}")
+                            file_indicators += 1
+                            indicator_count += 1
+                    self.results.append((file_path, details, file_indicators))
+            except Exception as e:
+                self.results.append((file_path, [f"Error: {str(e)}"], 0))
+
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.output.insert(tk.END, f"Scan completed: {now}\n")
+        self.output.insert(tk.END, f"Files scanned: {scanned_files}\n")
+        self.output.insert(tk.END, f"Suspicious files: {suspicious_count}\n")
+        self.output.insert(tk.END, f"Indicators matched: {indicator_count}\n")
+        self.output.insert(tk.END, "="*60 + "\n\n")
+
+        if self.results:
+            self.output.insert(tk.END, "SUSPICIOUS FILES:\n" + "-"*60 + "\n")
+            for idx, (path, details, _) in enumerate(self.results, 1):
+                self.output.insert(tk.END, f"{idx}. {path}\n")
+                for d in details:
+                    self.output.insert(tk.END, f"   {d}\n")
+                self.output.insert(tk.END, "-"*60 + "\n")
+
+        # Show non-malicious
+        self.output.insert(tk.END, "\nNON-MALICIOUS FILES:\n" + "-"*60 + "\n")
+        detected = set(r[0] for r in self.results)
+        for file_path in all_files:
+            if file_path not in detected:
+                self.output.insert(tk.END, f"{file_path}\n")
+
+    def quarantine_files(self):
+        if not self.quarantine_path:
+            messagebox.showerror("Error", "Please select a quarantine folder.")
+            return
+
+        if not self.results:
+            messagebox.showinfo("Info", "No suspicious files to quarantine.")
+            return
+
+        moved = 0
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        quarantine_root = os.path.join(self.quarantine_path, f"quarantine_{timestamp}")
+
+        for file_path, _, _ in self.results:
+            try:
+                rel_path = os.path.relpath(file_path, self.folder_path)
+                target_path = os.path.join(quarantine_root, rel_path)
+                os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                shutil.move(file_path, target_path)
+                self.output.insert(tk.END, f"Moved to quarantine: {file_path} -> {target_path}\n")
+                moved += 1
+            except Exception as e:
+                self.output.insert(tk.END, f"Failed to move {file_path}: {str(e)}\n")
+
+        messagebox.showinfo("Quarantine Complete", f"Moved {moved} file(s) to quarantine.")
+
+    def export_report(self):
+        content = self.output.get("1.0", tk.END)
+        if not content.strip():
+            messagebox.showinfo("Info", "No scan results to export.")
+            return
+
+        file = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text files", "*.txt")])
+        if file:
+            try:
+                with open(file, "w") as f:
+                    f.write(content)
+                messagebox.showinfo("Export Complete", f"Report saved to {file}")
+            except Exception as e:
+                messagebox.showerror("Export Error", f"Failed to save report:\n{str(e)}")
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = YaraScannerApp(root)
+    root.mainloop()
